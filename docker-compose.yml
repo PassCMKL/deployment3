@@ -1,0 +1,16 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: mnist-redis
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    container_name: mnist-backend-v3
+    environment:
+      - REDIS_HOST=redis
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
