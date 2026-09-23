@@ -1,5 +1,7 @@
+import asyncio
 import io
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import anyio.to_thread
@@ -12,10 +14,12 @@ from pydantic import BaseModel
 
 MODEL_PATH = Path(__file__).resolve().parent / "model_fp32.onnx"
 IMAGE_SIZE = 28
+BATCH_TIMEOUT = 0.002  # 2ms window, starting from the first request in a new batch
+BATCH_MAX_SIZE = 4
 
 session = ort.InferenceSession(str(MODEL_PATH), providers=["CPUExecutionProvider"])
 
-app = FastAPI(title="MNIST Digit Recognizer API (ONNX)")
+app = FastAPI(title="MNIST Digit Recognizer API (ONNX, dynamic batching)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,14 +52,56 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     return exp / exp.sum()
 
 
-def run_inference(tensor: np.ndarray) -> np.ndarray:
+@dataclass
+class BatchItem:
+    tensor: np.ndarray
+    future: "asyncio.Future[np.ndarray]"
+
+
+request_queue: "asyncio.Queue[BatchItem]" = asyncio.Queue()
+
+
+def run_batch_inference(batch_tensor: np.ndarray) -> np.ndarray:
     # Runs on a worker thread (see anyio.to_thread.run_sync below), not the
-    # event loop thread, so it no longer blocks other requests while it runs.
+    # event loop thread, so a slow batch still doesn't block new requests
+    # from queuing up for the *next* batch while this one runs.
     infer_start = time.time()
-    logits = session.run(["logits"], {"input": tensor})[0][0]
+    logits_batch = session.run(["logits"], {"input": batch_tensor})[0]
     infer_end = time.time()
-    print(f"[predict] infer_start={infer_start:.4f} infer_end={infer_end:.4f} duration={infer_end - infer_start:.4f}s", flush=True)
-    return logits
+    print(
+        f"[batch] size={batch_tensor.shape[0]} infer_start={infer_start:.4f} "
+        f"infer_end={infer_end:.4f} duration={infer_end - infer_start:.4f}s",
+        flush=True,
+    )
+    return logits_batch
+
+
+async def batch_worker():
+    loop = asyncio.get_event_loop()
+    while True:
+        first_item = await request_queue.get()
+        batch = [first_item]
+        deadline = loop.time() + BATCH_TIMEOUT
+
+        while len(batch) < BATCH_MAX_SIZE:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(await asyncio.wait_for(request_queue.get(), timeout=remaining))
+            except asyncio.TimeoutError:
+                break
+
+        batch_tensor = np.concatenate([item.tensor for item in batch], axis=0)
+        logits_batch = await anyio.to_thread.run_sync(run_batch_inference, batch_tensor)
+
+        for i, item in enumerate(batch):
+            item.future.set_result(logits_batch[i])
+
+
+@app.on_event("startup")
+async def launch_batch_worker():
+    asyncio.create_task(batch_worker())
 
 
 @app.get("/health")
@@ -83,7 +129,10 @@ async def predict(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not process image: {exc}") from exc
 
-    logits = await anyio.to_thread.run_sync(run_inference, tensor)
+    future: "asyncio.Future[np.ndarray]" = asyncio.get_event_loop().create_future()
+    await request_queue.put(BatchItem(tensor=tensor, future=future))
+    logits = await future
+
     probabilities = softmax(logits)
     digit = int(np.argmax(probabilities))
     confidence = float(probabilities[digit])
