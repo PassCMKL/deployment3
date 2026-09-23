@@ -2,6 +2,7 @@ import io
 import time
 from pathlib import Path
 
+import anyio.to_thread
 import numpy as np
 import onnxruntime as ort
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -47,6 +48,16 @@ def softmax(logits: np.ndarray) -> np.ndarray:
     return exp / exp.sum()
 
 
+def run_inference(tensor: np.ndarray) -> np.ndarray:
+    # Runs on a worker thread (see anyio.to_thread.run_sync below), not the
+    # event loop thread, so it no longer blocks other requests while it runs.
+    infer_start = time.time()
+    logits = session.run(["logits"], {"input": tensor})[0][0]
+    infer_end = time.time()
+    print(f"[predict] infer_start={infer_start:.4f} infer_end={infer_end:.4f} duration={infer_end - infer_start:.4f}s", flush=True)
+    return logits
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -72,10 +83,7 @@ async def predict(file: UploadFile = File(...)):
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not process image: {exc}") from exc
 
-    infer_start = time.time()
-    logits = session.run(["logits"], {"input": tensor})[0][0]
-    infer_end = time.time()
-    print(f"[predict] infer_start={infer_start:.4f} infer_end={infer_end:.4f} duration={infer_end - infer_start:.4f}s", flush=True)
+    logits = await anyio.to_thread.run_sync(run_inference, tensor)
     probabilities = softmax(logits)
     digit = int(np.argmax(probabilities))
     confidence = float(probabilities[digit])
